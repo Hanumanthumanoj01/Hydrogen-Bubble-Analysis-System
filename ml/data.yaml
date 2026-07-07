@@ -1,0 +1,15 @@
+# Hydrogen bubble detection — YOLO dataset config
+#
+# IMPORTANT: as of this commit, train and val both point at the SAME 3 images
+# (bubble_density_100/200/600mA), because that's all the labeled data that
+# exists right now. This is a smoke-test configuration to prove the training
+# pipeline runs end-to-end — it is NOT a real train/val split and a model
+# "trained" on this will not generalize. See ml/README.md before running
+# this for real.
+
+path: dataset
+train: images/train
+val: images/val
+
+names:
+  0: bubble
