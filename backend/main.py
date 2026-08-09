@@ -3,7 +3,7 @@ git remote add origin https://github.com/Hanumanthumanoj01/Hydrogen-Bubble-Analy
 Frankfurt University of Applied Sciences · Fuel Cell Laboratory
 Author: Manoj Hanumanthu  |  Supervisor: Prof. Dr. Enno Wagner
 """
-
+""
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
