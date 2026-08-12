@@ -15,8 +15,12 @@ from pydantic import BaseModel
 from typing import Optional
 import uvicorn
 
+import os
+import tempfile
+
 from bubble_analysis import BubbleAnalyzer
 from simulator import ElectrolyzerSimulator
+from video_analysis import analyze_video
 
 app = FastAPI(
     title="Hydrogen Bubble Analysis API",
@@ -72,6 +76,56 @@ async def analyze_image(
     result = analyzer.full_analysis(
         img, current_density, electrode_type, cathode_area, sensitivity
     )
+    return JSONResponse(content=result)
+
+
+@app.post("/analyze_video")
+async def analyze_video_endpoint(
+    file: UploadFile = File(...),
+    current_density: float = Form(900.0),
+    cathode_area: float = Form(2.54),
+    thresh_percentile: float = Form(88.0),
+    frame_step: int = Form(1),
+    min_persistence: int = Form(2),
+    use_rolling_bg: bool = Form(False),
+):
+    """
+    Analyze an uploaded electrolysis VIDEO using temporal background
+    subtraction (see video_analysis.py for why this is the primary method
+    for video rather than the single-frame detector used by /analyze).
+
+    The static electrode is reconstructed as the per-pixel temporal median
+    and subtracted, which removes scratches / mesh / specular hot-spots that
+    are indistinguishable from bubble rims in any single frame.
+
+    Returns per-frame metrics, a summary including bubble growth-rate and
+    lifetime statistics from tracking, and the computed background image.
+    """
+    suffix = os.path.splitext(file.filename or "")[1] or ".mp4"
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty video upload")
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(contents)
+            tmp_path = tmp.name
+        result = analyze_video(
+            tmp_path,
+            current_density=current_density,
+            cathode_area=cathode_area,
+            thresh_percentile=thresh_percentile,
+            frame_step=frame_step,
+            min_persistence=min_persistence,
+            use_rolling_bg=use_rolling_bg,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
     return JSONResponse(content=result)
 
 
