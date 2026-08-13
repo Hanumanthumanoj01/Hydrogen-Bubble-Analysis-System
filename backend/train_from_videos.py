@@ -48,12 +48,49 @@ from video_analysis import (
     detect_bubbles_bgsub, shannon_entropy, MM_PER_PIXEL,
 )
 
-VIDEOS = {
-    100: ('20260713_bigbubbles_100mA_1760mV_39deg.mp4', 1760, 39),
-    300: ('20260713_bigbubbles_300mA_1971mV_39deg.mp4', 1971, 39),
-    600: ('20260713_bigbubbles_600mA_2133mV_41deg.mp4', 2133, 41),
-    900: ('20260713_bigbubbles_900mA_2264mV_42deg__1_.mp4', 2264, 42),
-}
+import re
+import glob
+
+# Videos are DISCOVERED from the folder, not hardcoded. Any .mp4/.mov/.avi
+# whose filename contains a current density like "900mA" is picked up, so new
+# recordings work without editing this file. Voltage ("2264mV") and temperature
+# ("42deg") are also parsed when present, but are optional.
+#
+# Examples that all parse correctly:
+#   20260713_bigbubbles_900mA_2264mV_42deg.mp4  -> 900 mA/cm2, 2264 mV, 42 C
+#   run3_450mA.mp4                              -> 450 mA/cm2
+#   GDE_1000mA_2400mV.mov                       -> 1000 mA/cm2, 2400 mV
+VIDEO_EXTS = ('*.mp4', '*.mov', '*.avi', '*.MP4', '*.MOV')
+
+
+def parse_video_name(path):
+    """Extract (current_density, voltage_mV, temp_C) from a filename.
+    Returns None for current density if the filename has no 'NNNmA' pattern."""
+    name = os.path.basename(path)
+    cd = re.search(r'(\d{2,4})\s*mA', name, re.I)
+    mv = re.search(r'(\d{3,5})\s*mV', name, re.I)
+    tc = re.search(r'(\d{1,3})\s*deg', name, re.I)
+    return (int(cd.group(1)) if cd else None,
+            int(mv.group(1)) if mv else None,
+            int(tc.group(1)) if tc else None)
+
+
+def discover_videos(folder):
+    """Find all usable videos in `folder`, keyed by current density."""
+    paths = []
+    for pat in VIDEO_EXTS:
+        paths.extend(glob.glob(os.path.join(folder, pat)))
+    found = {}
+    for p in sorted(paths):
+        cd, mv, tc = parse_video_name(p)
+        if cd is None:
+            print(f'  ignored (no "NNNmA" in name): {os.path.basename(p)}')
+            continue
+        if cd in found:
+            print(f'  ignored (duplicate {cd} mA/cm2): {os.path.basename(p)}')
+            continue
+        found[cd] = (p, mv, tc)
+    return found
 
 FEATURE_NAMES = [
     'bubble_count', 'mean_diameter_mm', 'std_diameter_mm', 'max_diameter_mm',
@@ -87,22 +124,45 @@ def frame_features(gray, bubbles):
     ]
 
 
-def build_dataset(upload_dir='/mnt/user-data/uploads'):
+def build_dataset(upload_dir=None):
+    """Build the feature dataset from the videos in `upload_dir`.
+
+    Pass the folder as the first command-line argument, e.g.
+        python3 train_from_videos.py ~/Downloads/videos
+    If omitted, looks in ./videos next to this script.
+    """
+    if upload_dir is None:
+        upload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'videos')
+    if not os.path.isdir(upload_dir):
+        print(f'ERROR: folder not found: {upload_dir}')
+        print('Put the 4 .mp4 files in a folder and pass it as an argument:')
+        print('    python3 train_from_videos.py /path/to/your/videos')
+        sys.exit(1)
+    print(f'Looking for videos in: {upload_dir}')
+    videos = discover_videos(upload_dir)
+    if len(videos) < 2:
+        print(f'\nERROR: found {len(videos)} usable video(s). Need at least 2 to train.')
+        print('Videos must be .mp4/.mov/.avi with the current density in the name,')
+        print('e.g. 20260713_bigbubbles_900mA_2264mV_42deg.mp4  or  run3_450mA.mp4')
+        sys.exit(1)
+
+    print(f'Found {len(videos)} videos at: {sorted(videos.keys())} mA/cm2\n')
     X, y, groups = [], [], []
-    for cd, (fname, mv, deg) in VIDEOS.items():
-        path = os.path.join(upload_dir, fname)
-        if not os.path.exists(path):
-            print(f'  skip (missing): {fname}')
-            continue
+    for cd in sorted(videos):
+        path, mv, tc = videos[cd]
         frames, fps = load_video_gray(path)
         bg = compute_background(frames)
         thr = auto_threshold(frames, bg=bg)
-        for i, g in enumerate(frames):
+        for g in frames:
             bubbles = detect_bubbles_bgsub(g, bg, thr)
             X.append(frame_features(g, bubbles))
             y.append(cd)
             groups.append(cd)
-        print(f'  {cd:>4} mA/cm2: {len(frames)} frames, threshold={thr:.1f}')
+        extra = []
+        if mv: extra.append(f'{mv} mV')
+        if tc: extra.append(f'{tc} C')
+        suffix = f'  [{", ".join(extra)}]' if extra else ''
+        print(f'  {cd:>4} mA/cm2: {len(frames)} frames, threshold={thr:.1f}{suffix}')
     return np.array(X, dtype=float), np.array(y, dtype=float), np.array(groups)
 
 
@@ -112,7 +172,8 @@ def main():
     from sklearn.metrics import mean_absolute_error, r2_score
 
     print('Extracting features from videos...')
-    X, y, groups = build_dataset()
+    folder = sys.argv[1] if len(sys.argv) > 1 else None
+    X, y, groups = build_dataset(folder)
     print(f'\nDataset: {X.shape[0]} frames x {X.shape[1]} features, '
           f'{len(np.unique(groups))} operating points\n')
 

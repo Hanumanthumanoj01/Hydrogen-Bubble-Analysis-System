@@ -42,7 +42,7 @@ class BubbleAnalyzer:
     ) -> Dict[str, Any]:
         """Run the complete two-branch pipeline and return all metrics + images."""
 
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(img_bgr, cv2.   COLOR_BGR2GRAY)
 
         # ── Branch 1: Shannon entropy ─────────────────────────────────────────
         H, H_norm = self.shannon_entropy(gray)
