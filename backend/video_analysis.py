@@ -45,10 +45,14 @@ import cv2
 import numpy as np
 from typing import List, Tuple, Dict, Any, Optional
 
-MM_PER_PIXEL: float = 0.0064      # Wagner et al. (2025) calibration
-FARADAY: float = 96485.0
-Z_ELECTRONS: int = 2
-MOLAR_VOLUME_H2: float = 22400.0  # mL/mol at STP
+# Imported from constants.py — the single source of truth shared with
+# bubble_analysis.py. mm_per_pixel("video") returns the video-specific scale
+# if the supervisor confirms the video optics differed from the paper's.
+from constants import (
+    FARADAY, Z_ELECTRONS, MOLAR_VOLUME_H2, mm_per_pixel,
+)
+
+MM_PER_PIXEL: float = mm_per_pixel("video")
 
 
 # ────────────────────────────────────────────────────────────────────────────

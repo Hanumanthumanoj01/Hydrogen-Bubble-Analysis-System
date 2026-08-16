@@ -20,11 +20,14 @@ from typing import List, Dict, Any, Tuple, Optional
 
 
 # ── Physical / calibration constants ─────────────────────────────────────────
-MM_PER_PIXEL: float = 0.0064      # mm per pixel  (Wagner et al. 2025)
-FARADAY: float = 96485.0          # C/mol
-Z_ELECTRONS: int = 2              # electrons per H₂ molecule
-M_H2: float = 2.016               # g/mol
-MOLAR_VOLUME_H2: float = 22400.0  # mL/mol  (STP)
+# Imported from constants.py — the single source of truth shared with
+# video_analysis.py. Do NOT redefine these here: if the image engine and the
+# video engine hold separate copies, changing the calibration in one place
+# silently leaves the other measuring in different units.
+from constants import (
+    MM_PER_PIXEL, FARADAY, Z_ELECTRONS, M_H2, MOLAR_VOLUME_H2,
+    SIZE_BINS_MM, SIZE_BIN_LABELS,
+)
 
 
 class BubbleAnalyzer:
@@ -42,7 +45,7 @@ class BubbleAnalyzer:
     ) -> Dict[str, Any]:
         """Run the complete two-branch pipeline and return all metrics + images."""
 
-        gray = cv2.cvtColor(img_bgr, cv2.   COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
         # ── Branch 1: Shannon entropy ─────────────────────────────────────────
         H, H_norm = self.shannon_entropy(gray)
