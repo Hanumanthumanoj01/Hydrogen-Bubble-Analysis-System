@@ -1,0 +1,252 @@
+TEST PLAN — from installation to the finished PDF
+==================================================
+
+Work through the steps in order. The last check, check_results.py, compares
+every number of the report with your own outputs automatically, so you do not
+have to compare numbers by hand. Send its output file back; if it says
+"0 failed   0 skipped", the report and your data agree.
+
+All folder names are relative to the project folder, the one that holds
+backend/ and frontend/ (for example ~/Downloads/hydrogen-bubble-analysis).
+
+
+----------------------------------------------------------------------
+STEP 1   INSTALL
+----------------------------------------------------------------------
+Unzip code_bundle.zip INTO the project folder so that its backend/ and
+frontend/ merge with yours (replace files when asked). Your own simulator.py,
+package.json, CameraAnalyzer.jsx, export.js and index.css are not in the
+bundle and stay as they are. The Image tab (ImageAnalyzer.jsx) is unchanged.
+backend/run_session_D.py and backend/make_session_D.py from earlier
+bundles are replaced by make_sessions.py; you may delete them.
+NEW IN v10/v11: the "Every bubble, froth included" detector of Tab 1 was
+rewritten (report Sections 3.5 and 3.15.7), and both detectors now ignore
+the timestamp text, black borders and player bar of a screen capture.
+Step 4a has new expected values and Step 4e checks a screen capture.
+v11 also adds the cloud deployment files (Dockerfile, .dockerignore,
+render.yaml, backend/requirements.txt; see DEPLOY_GUIDE.pdf), lowers the
+memory of the Video tab, and refines the wording rules of make_sessions.py.
+Copy Dockerfile, .dockerignore and render.yaml into the project folder.
+
+    cd ~/Downloads/hydrogen-bubble-analysis
+    pip3 install opencv-python numpy scipy scikit-image pandas matplotlib \
+                 openpyxl fastapi uvicorn python-multipart scikit-learn joblib
+    python3 verify_install.py
+
+EXPECT  sections 1-6 PASS, section 7 "skip" (server not started yet).
+
+[ ] done
+
+
+----------------------------------------------------------------------
+STEP 2   PUT THE DATA IN PLACE  (one command does the checking)
+----------------------------------------------------------------------
+This is where every file has to be. The names on the left are what the
+scripts look for, all inside backend/:
+
+  backend/
+    session_A/     Session A, the 12 AVI files 020mA_01.avi ... 500mA_01.avi
+    session_B/     Session B, the 16 AVI files 20260713_bigbubbles_...avi
+                   (ONLY the AVI files, no MP4 copies in here)
+    session_C/     Session C, the 5 AVI files bubble_video_...avi
+    Session_D/     Session D, the 10 recordings at 50 ... 500 mA/cm2
+    Session_E/     Session E, all its recordings (3D electrode and mesh)
+    Session_F/     Session F, all its recordings (also the copies of Session D
+                   recordings it contains: they are recognised and counted once)
+    videos/        5 copies: the 100, 300, 600 and 900 mA MP4 files
+                   and the 100 mA AVI (20260713_bigbubbles_...)
+    screenshots/   the two screen captures (211925_..._860mA, 212403_..._721mA),
+                   bubble_density_600mA_02.jpg, and later your 5 app screenshots
+    results_A/ results_B/ results_C/ results_screenshots/   (already computed)
+
+  Sessions D, E and F are analysed in Sections 4.14 to 4.16, and Section
+  4.17 compares all six sessions.
+
+You do not have to arrange this by hand. In the project folder:
+
+    python3 check_layout.py           shows what is where, changes nothing
+    python3 check_layout.py --fix     puts things in place
+    python3 check_layout.py           again: should say "Everything is in
+                                      place" apart from the screenshots of Step 4
+
+What --fix does: a session folder spelt differently ("Session A",
+"session-a", ...) gets a link under the expected name, your folder stays as
+it is; a required file found elsewhere in the project, in ~/Downloads or on
+the Desktop is COPIED to where it is needed; an MP4 copy lying in session_B/
+is MOVED to videos/. Nothing is deleted. Every action is printed.
+
+A file listed as [MISS] is not on the computer in any of these places:
+copy it in from wherever you keep the laboratory data and run the check again.
+
+The screen captures may keep the names macOS gave them, with spaces; both
+spellings are accepted.
+
+Send layout_report.txt (written by the check) together with the results of
+Step 7.
+
+[ ] done
+
+
+[ ] done
+
+
+----------------------------------------------------------------------
+STEP 3   START THE APPLICATION
+----------------------------------------------------------------------
+Terminal 1:   cd backend    &&  uvicorn main:app --reload --port 8000
+Terminal 2:   cd frontend   &&  npm run dev
+Open http://localhost:5173 and hard-reload (Cmd+Shift+R).
+
+EXPECT  four tabs: Image Analyzer | Camera / Video | Video Analyzer |
+        Histogram / Fisher
+Terminal 3:   python3 verify_install.py
+EXPECT  55 passed, 0 failed.
+
+[ ] done
+
+
+----------------------------------------------------------------------
+STEP 4   THE FIVE SCREENSHOTS  (save in backend/screenshots/)
+----------------------------------------------------------------------
+Rename each screenshot to the name after the arrow (these five names must
+be exact, because the LaTeX project uses them).
+
+4a  Tab 1. Load bubble_density_600mA_02.jpg. Current density 600, cathode
+    area 2.54, What to detect "Every bubble, froth included", sensitivity
+    Medium, electrode Gas Diffusion Electrode. Press "Analyze image".
+    EXPECT  85 | 4.951 | 89.29 % | 10.614 mL/min
+            Look at the overlay: the circles sit on the bright rims of
+            bubbles, none on the mesh lines or on empty background.
+            RETAKE both screenshots below: the old ones show the replaced
+            detector (110 bubbles).
+    -> screenshot_image_analyzer.png       the whole window
+    -> screenshot_detection_overlay.png    only the overlay image
+
+4b  Tab 4. Same picture, default settings, "Analyze picture".
+    EXPECT  4.951 | 89.29 % | J 1.668e-3 | x/y 1.025 | edge/flat 4.22,
+            20 peaks, all "yes"
+    -> screenshot_fisher_map.png    view "F = Fx + Fy", values visible
+    -> screenshot_fisher_peaks.png  view "Peaks", peak table visible
+
+4c  Tab 3. Load videos/20260713_bigbubbles_100mA_1760mV_39deg.mp4.
+    Current density 100, cathode area 2.54, "Bubbles on the plate — dark
+    centre", smallest bubble 3 %, electrode Expanded Nickel Mesh, camera
+    frame rate 200 fps, every 5 frames, stop after 60 frames.
+    EXPECT  18 intervals; interval 1 shows 6 bubbles, each circle along the
+            outer rim of a whole bubble (one of them the bubble cut by the
+            top edge); two clicks on ▶ give
+            "Interval 3 / 18 · frame 10 · 0.05s"
+    -> screenshot_video_analyzer.png  image, interval strip and table visible
+
+4d  Tab 3, the check of the detection fix. Same settings, but load the AVI
+    file videos/20260713_bigbubbles_100mA_1760mV_39deg.avi and click the
+    6th thumbnail ("Interval 6 / 18 · frame 25").
+    EXPECT  6 bubbles; no small circles inside a bubble and none on the
+            plate. (Before the fix this frame showed 12 circles.)
+            Report Figure 25, bottom row, shows this frame before and after.
+
+4e  Tab 1, a screen capture (no screenshot to save, just look).
+    Load Screenshot_2026-08-25_212403_bubbles_flattend_721mA_40deg.png,
+    electrode ANS, current density 720.
+    a) What to detect "Main bubbles", press "Analyze image".
+       EXPECT  4 bubbles, one circle on each of the four bubbles.
+    b) What to detect "Every bubble, froth included", sensitivity Low.
+       EXPECT  20 bubbles: the four large bubbles circled at their rim and
+               small circles on small round spots of the plate. NO circle on
+               the red timestamp, the black border on the left or the player
+               bar at the bottom. (Before v10 this showed 215.)
+       At sensitivity Medium (71) more small spots are circled: on a close-up
+       a single picture cannot tell a tiny bubble from a pit in the plate, so
+       use "Main bubbles" for close-ups.
+
+[ ] done
+
+
+----------------------------------------------------------------------
+STEP 5   MAKE EVERY FIGURE, THE OVERVIEW AND SECTIONS 4.14-4.18
+         (about 30-50 minutes)
+----------------------------------------------------------------------
+    cd backend
+    python3 make_all_figures.py
+
+It also runs make_sessions.py, which analyses every recording of Sessions
+D, E and F and writes the entropy overview at the start of Chapter 4
+(Figure 16), Sections 4.14 to 4.18 and Figures 28 to 32 from them, and
+track_sites.py on every recording of Session C and Sessions D to F with the
+bore grid of the ANS plate (Figure 10). It also runs fisher_paths.py on the
+Session B and C recordings (Figure 24, Section 4.9.5).
+
+EXPECT  in the log, step "Figure 24: stable bubble paths":
+          100mA ... share 0.231 ... STABLE
+          300mA ... share 0.161 ... STABLE
+          600mA ... share 0.101 ... not stable
+          900mA ... share 0.046 ... not stable
+          688mA ... share 0.216 ... STABLE
+EXPECT  in figures_for_overleaf/sessions_values.txt a line
+          "path share % [...]" for every group of Sessions D, E and F
+EXPECT  at the end: "34 of 34 files (32 figures, sessions_DEF.tex and
+        fisher_paths.tex) are in figures_for_overleaf/"
+        (any "----" line names the missing file and how to make it)
+
+[ ] done
+
+
+----------------------------------------------------------------------
+STEP 6   RETRAIN THE RANDOM FOREST  (Section 4.7, about 2 minutes)
+----------------------------------------------------------------------
+    python3 train_from_videos.py videos
+
+EXPECT  LEAVE-ONE-VIDEO-OUT  MAE = 238.2 mA/cm2
+        RANDOM 5-FOLD FRAME SPLIT  MAE = 84.9 mA/cm2   R2 = 0.769
+        shannon_H 0.3275, H_norm 0.3249
+
+[ ] done
+
+
+----------------------------------------------------------------------
+STEP 7   CHECK EVERY NUMBER OF THE REPORT
+----------------------------------------------------------------------
+    python3 check_results.py --full > check_results_output.txt 2>&1
+    tail -5 check_results_output.txt
+
+EXPECT  about 110 checks, each PASS (section 3d: the five path shares), ending with
+        "... passed   0 failed   0 skipped"
+        "Every number checked agrees with the report."
+Send check_results_output.txt, figures_for_overleaf/sessions_values.txt,
+figures_for_overleaf/nucleation_sites_values.txt and layout_report.txt
+back. Section 3c of the output checks Sessions D, E
+and F: for Session D ten recordings, a step of 50 mA/cm2 and a voltage for
+every file; for all three, that the numbers written into Sections 4.14 to
+4.18 equal the numbers recomputed from results_D/E/F/summary.csv.
+
+[ ] done
+
+
+----------------------------------------------------------------------
+STEP 8   OVERLEAF
+----------------------------------------------------------------------
+1. overleaf.com -> New Project -> Upload Project -> overleaf_project.zip.
+   Compiler pdfLaTeX. Recompile: about 60 pages, red boxes where figures go,
+   and red boxes at the start of Chapter 4 and at Section 4.14.
+2. Upload every file of backend/figures_for_overleaf/ into figures/:
+   the 32 .png files AND sessions_DEF.tex AND fisher_paths.tex.
+3. Upload the official Frankfurt UAS logo as figures/logo.png.
+4. main.tex: fill in the three FILL IN fields (matriculation number, date,
+   Fuel reference). Recompile.
+EXPECT  no red box and no red text anywhere; 32 entries in the List of
+        Figures; Chapter 4 opens with "Overview: entropy in all six
+        sessions" (one table, Figure 16); Section 4.10 has the table
+        "Before and after the rewrite, in numbers"; Figure 10 shows one site
+        map per recording of the bored plate and the summary panel;
+        Sections 4.14 to 4.17 with a table and a figure for each of
+        Sessions D, E and F and the comparison of all six sessions;
+        Section 4.18 "Which electrode structure works more efficiently?"
+        with two tables and Figure 32 (3D structure against mesh GDE);
+        Section 4.9.5 "Stable bubble paths" with Figure 24 and a paragraph
+        of numbers (no red text); equations numbered (1) to (13); the
+        abstract has a paragraph "Sessions D to F."; Appendix C lists the
+        13 interim comments (C.1) and the 26 comments on V1 (C.2).
+5. Upload the new figures_for_overleaf/ also to the Drive folder
+   "06 — Report figures" that Section 4.8 links to, replacing the old ones.
+
+[ ] done

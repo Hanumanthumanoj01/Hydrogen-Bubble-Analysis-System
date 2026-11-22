@@ -1,6 +1,10 @@
 """
 fisher_analysis.py
 ==================
+HOW TO RUN (from the backend folder):
+    python3 fisher_analysis.py <video_folder> [cell_px] [x0 y0 x1 y1] [--filter-tiny]
+    python3 fisher_analysis.py session_C --filter-tiny      (Figure 11 of the report)
+
 Implementation of the workflow specified in
 
     "Procedure for data evaluation with AI based bubble analysis"
@@ -47,6 +51,7 @@ from typing import List, Tuple, Dict, Any, Optional
 
 from video_analysis import (
     load_video_gray, compute_background, auto_threshold, detect_bubbles_bgsub,
+    classify_anchored_bubbles,
 )
 from constants import mm_per_pixel
 
@@ -56,16 +61,39 @@ from constants import mm_per_pixel
 # ────────────────────────────────────────────────────────────────────────────
 def extract_bubble_table(video_path: str, current_density: float,
                          frame_step: int = 1,
-                         max_frames: int = 600) -> Tuple[List[Dict[str, float]], Tuple[int, int]]:
+                         max_frames: int = 600,
+                         filter_tiny: bool = False,
+                         anchor_kwargs: Optional[dict] = None):
     """Run detection over a video and return the (x, y, d, t, j) table.
 
     This is the "Excel-table with x, y, dB" the handout describes as the
     output of the bubble analysis and the input to everything below.
+
+    filter_tiny=True applies classify_anchored_bubbles() (see video_analysis.py)
+    to remove tiny floating disturbance bubbles per Prof. Wagner's request of
+    10 Sept 2026, keeping only bubbles that persist at a fixed position for
+    many frames -- i.e. real nucleation-site bubbles, not transient noise in
+    the liquid. Returns only the anchored-site records in that case; the raw,
+    unfiltered table is still what you get with filter_tiny=False (default),
+    matching the original handout's Excel-table with no bubble excluded.
     """
     frames, fps = load_video_gray(video_path, max_frames=max_frames)
     bg = compute_background(frames)
     thr = auto_threshold(frames, bg=bg)
     scale = mm_per_pixel("video")
+
+    if filter_tiny:
+        sites = classify_anchored_bubbles(frames, bg, thr, fps, **(anchor_kwargs or {}))
+        rows: List[Dict[str, float]] = []
+        for site in sites:
+            for (t, x, y, r) in site["history"]:
+                rows.append({
+                    "x": float(x), "y": float(y),
+                    "d_px": float(2 * r), "d_mm": float(2 * r * scale),
+                    "t": float(t), "j": float(current_density),
+                })
+        h, w = frames[0].shape
+        return rows, (h, w), len(sites)
 
     rows: List[Dict[str, float]] = []
     for idx in range(0, len(frames), max(1, frame_step)):
@@ -79,7 +107,7 @@ def extract_bubble_table(video_path: str, current_density: float,
                 "j": float(current_density),
             })
     h, w = frames[0].shape
-    return rows, (h, w)
+    return rows, (h, w), None
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -244,18 +272,24 @@ def export_map_csv(arr: np.ndarray, path: str) -> None:
 # ────────────────────────────────────────────────────────────────────────────
 def _parse_j_from_name(fname: str) -> Optional[int]:
     import re
-    m = re.search(r"(\d{2,4})\s*mA", os.path.basename(fname), re.I)
+    m = re.search(r"(?<!\d)(\d{2,5})\s*mA", os.path.basename(fname), re.I)
     return int(m.group(1)) if m else None
 
 
 def run_workflow(video_dir: str, out_dir: str = "fisher_output",
                  cell: int = 20, region: Optional[Tuple[int, int, int, int]] = None,
-                 make_plot: bool = True) -> None:
+                 make_plot: bool = True, filter_tiny: bool = False) -> None:
     """Run Steps 1-5 over every video in `video_dir` and write all outputs.
 
     Videos are discovered automatically; the current density is read from the
     filename (e.g. ..._900mA_...mp4). At least two different current densities
     are required, because Step 5 needs a derivative between neighbouring j.
+
+    filter_tiny=True removes tiny floating disturbance bubbles before Steps
+    1-5 (Prof. Wagner, 10 Sept 2026), keeping only bubbles anchored at a
+    nucleation site for many consecutive frames. See
+    video_analysis.classify_anchored_bubbles() for the method and why a
+    simple size threshold does not work.
     """
     import glob
 
@@ -279,16 +313,21 @@ def run_workflow(video_dir: str, out_dir: str = "fisher_output",
         print("Step 5 requires two neighbouring current densities to take a derivative.")
         return
 
-    print(f"Found {len(videos)} videos: {sorted(videos)} mA/cm2\n")
+    print(f"Found {len(videos)} videos: {sorted(videos)} mA/cm2")
+    if filter_tiny:
+        print("Tiny disturbing bubbles will be filtered out (anchored-site bubbles only)\n")
+    else:
+        print()
 
     # ---- Step 0: bubble tables -------------------------------------------
     print("STEP 0  building (x, y, d, t, j) tables")
     tables, shape = {}, None
     for j in sorted(videos):
-        rows, shape = extract_bubble_table(videos[j], j)
+        rows, shape, n_sites = extract_bubble_table(videos[j], j, filter_tiny=filter_tiny)
         tables[j] = rows
         export_bubble_table_csv(rows, os.path.join(out_dir, f"bubbles_{j}mA.csv"))
-        print(f"   j={j:>4}: {len(rows):>6} bubble records  ->  bubbles_{j}mA.csv")
+        extra = f"  ({n_sites} anchored sites)" if n_sites is not None else ""
+        print(f"   j={j:>4}: {len(rows):>6} bubble records  ->  bubbles_{j}mA.csv{extra}")
 
     # ---- Steps 1 & 2 ------------------------------------------------------
     print(f"\nSTEP 1  bubble-frequency map N(x,y|j)     [cell = {cell} px]")
@@ -328,13 +367,40 @@ def run_workflow(video_dir: str, out_dir: str = "fisher_output",
     print("\nSTEP 5  Fisher Information I_j(x,y)        [asterisk task]")
     js = sorted(dists)
     fisher_maps = {}
+    rows_out = []
+    print(f"   {'pair':>14} {'dj':>5} {'I_max':>11} {'I_max*dj^2':>12} {'empty':>7}")
     for a, b in zip(js[:-1], js[1:]):
-        I, empty = fisher_information(dists[a], dists[b], b - a)
+        dj = b - a
+        I, empty = fisher_information(dists[a], dists[b], dj)
         fisher_maps[(a, b)] = I
         export_map_csv(I, os.path.join(out_dir, f"fisher_I_{a}to{b}.csv"))
-        flag = "  <-- SPARSE, treat with caution" if empty > 0.80 else ""
-        print(f"   j={a:>4} -> {b:<4}  I_max={I.max():.3e}   "
-              f"empty states {empty*100:5.1f}%{flag}")
+        rows_out.append((a, b, dj, float(I.max()), empty))
+        flag = "  sparse" if empty > 0.80 else ""
+        print(f"   {a:>5} -> {b:<5} {dj:>5} {I.max():>11.3e} "
+              f"{I.max()*dj*dj:>12.3e} {empty*100:>6.1f}%{flag}")
+
+    # ---- warn when the spacing, not the physics, is driving the values ----
+    # The estimator is  I = sum p (dlnp/dj)^2  with  dlnp/dj ~ dlnp / dj,
+    # so I scales as 1/dj^2. If the current densities are unevenly spaced,
+    # closely-spaced pairs produce large I values for purely arithmetic
+    # reasons and the map is not comparable across pairs.
+    if len(rows_out) >= 2:
+        djs = [r[2] for r in rows_out]
+        raw = [r[3] for r in rows_out]
+        norm = [r[3] * r[2] ** 2 for r in rows_out]
+        spread_raw = max(raw) / max(min(raw), 1e-300)
+        spread_norm = max(norm) / max(min(norm), 1e-300)
+        if max(djs) / max(min(djs), 1) > 2.5:
+            print("\n   WARNING - the current densities are unevenly spaced "
+                  f"({min(djs)} to {max(djs)} mA/cm2 apart).")
+            print(f"   I_max varies {spread_raw:.0f}x across pairs, but only "
+                  f"{spread_norm:.0f}x after multiplying by dj^2.")
+            print("   Fisher information scales as 1/dj^2, so most of that "
+                  "variation is the spacing,")
+            print("   not the bubble physics. Compare pairs with similar dj, "
+                  "or use the I_max*dj^2")
+            print("   column above. Evenly spaced current densities would "
+                  "remove the problem entirely.")
 
     if make_plot:
         try:
@@ -351,26 +417,33 @@ def _plot_maps(tables, shape, fisher_maps, cell, out_dir):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    # One row per current density: N, d_m, and the Fisher map to the next
+    # current density. Laid out this way the figure keeps legible lettering
+    # at the printed width however many current densities there are.
     js = sorted(tables)
-    ncol = max(len(js), len(fisher_maps), 1)
-    fig, ax = plt.subplots(3, ncol, figsize=(4.2 * ncol, 11), squeeze=False)
+    pairs = sorted(fisher_maps.items())
+    nrow = max(len(js), 1)
+    fig, ax = plt.subplots(nrow, 3, figsize=(12.5, 3.3 * nrow + 0.8), squeeze=False)
     for i, j in enumerate(js):
         N = bubble_frequency_map(tables[j], shape, cell)
         dm = mean_diameter_map(tables[j], shape, cell)
-        im = ax[0][i].imshow(N, cmap="viridis")
-        ax[0][i].set_title(f"Step 1: N(x,y | {j} mA/cm²)", fontsize=9)
-        plt.colorbar(im, ax=ax[0][i], fraction=0.046)
-        im = ax[1][i].imshow(dm, cmap="plasma")
-        ax[1][i].set_title(f"Step 2: d_m(x,y | {j}) [mm]", fontsize=9)
-        plt.colorbar(im, ax=ax[1][i], fraction=0.046)
-    for i, (k, I) in enumerate(sorted(fisher_maps.items())):
-        im = ax[2][i].imshow(I, cmap="inferno")
-        ax[2][i].set_title(f"Step 5: Fisher I  j={k[0]}→{k[1]}", fontsize=9)
-        plt.colorbar(im, ax=ax[2][i], fraction=0.046)
+        im = ax[i][0].imshow(N, cmap="viridis")
+        ax[i][0].set_title(f"Step 1: N(x,y | {j} mA/cm²)", fontsize=13)
+        plt.colorbar(im, ax=ax[i][0], fraction=0.046)
+        im = ax[i][1].imshow(dm, cmap="plasma")
+        ax[i][1].set_title(f"Step 2: d_m(x,y | {j}) [mm]", fontsize=13)
+        plt.colorbar(im, ax=ax[i][1], fraction=0.046)
+        if i < len(pairs):
+            k, I = pairs[i]
+            im = ax[i][2].imshow(I, cmap="inferno")
+            ax[i][2].set_title(f"Step 5: Fisher I, {k[0]}→{k[1]} mA/cm²", fontsize=13)
+            plt.colorbar(im, ax=ax[i][2], fraction=0.046)
+        else:
+            ax[i][2].axis("off")
     for row in ax:
         for a in row:
             a.set_xticks([]); a.set_yticks([])
-    plt.suptitle("Bubble-state analysis and Fisher Information (Wagner workflow)", fontsize=13)
+    plt.suptitle("Bubble-state maps and Fisher information (five-step workflow)", fontsize=16)
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "workflow_maps.png"), dpi=140)
     plt.close()
@@ -386,8 +459,12 @@ if __name__ == "__main__":
         print("    python3 fisher_analysis.py videos")
         print("    python3 fisher_analysis.py videos 20")
         print("    python3 fisher_analysis.py videos 20 0 0 560 400   # 3x3 site region")
+        print("    python3 fisher_analysis.py videos --filter-tiny    # remove tiny floating bubbles")
         sys.exit(1)
     folder = sys.argv[1]
-    cell_px = int(sys.argv[2]) if len(sys.argv) > 2 else 20
-    reg = tuple(int(v) for v in sys.argv[3:7]) if len(sys.argv) >= 7 else None
-    run_workflow(folder, cell=cell_px, region=reg)
+    args = sys.argv[2:]
+    filter_tiny = "--filter-tiny" in args
+    args = [a for a in args if a != "--filter-tiny"]
+    cell_px = int(args[0]) if len(args) > 0 else 20
+    reg = tuple(int(v) for v in args[1:5]) if len(args) >= 5 else None
+    run_workflow(folder, cell=cell_px, region=reg, filter_tiny=filter_tiny)

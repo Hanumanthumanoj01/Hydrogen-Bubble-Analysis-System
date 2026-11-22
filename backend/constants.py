@@ -1,6 +1,8 @@
 """
 constants.py
 ============
+Library module, not run directly: imported by the analysis scripts.
+
 SINGLE SOURCE OF TRUTH for the physical and calibration constants used by
 BOTH analysis engines (bubble_analysis.py for images, video_analysis.py for
 video).

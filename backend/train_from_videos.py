@@ -1,7 +1,10 @@
 """
 train_from_videos.py
 ====================
-Trains the Sprint-7 baseline ML model on the four ANS video recordings.
+Trains the Sprint-7 baseline ML model on four Session B recordings
+(100, 300, 600 and 900 mA/cm2, MP4 copies).
+
+    python3 train_from_videos.py [folder]        default folder: videos
 
 WHAT THIS TRAINS (and what it does not)
 ---------------------------------------
@@ -48,49 +51,12 @@ from video_analysis import (
     detect_bubbles_bgsub, shannon_entropy, MM_PER_PIXEL,
 )
 
-import re
-import glob
-
-# Videos are DISCOVERED from the folder, not hardcoded. Any .mp4/.mov/.avi
-# whose filename contains a current density like "900mA" is picked up, so new
-# recordings work without editing this file. Voltage ("2264mV") and temperature
-# ("42deg") are also parsed when present, but are optional.
-#
-# Examples that all parse correctly:
-#   20260713_bigbubbles_900mA_2264mV_42deg.mp4  -> 900 mA/cm2, 2264 mV, 42 C
-#   run3_450mA.mp4                              -> 450 mA/cm2
-#   GDE_1000mA_2400mV.mov                       -> 1000 mA/cm2, 2400 mV
-VIDEO_EXTS = ('*.mp4', '*.mov', '*.avi', '*.MP4', '*.MOV')
-
-
-def parse_video_name(path):
-    """Extract (current_density, voltage_mV, temp_C) from a filename.
-    Returns None for current density if the filename has no 'NNNmA' pattern."""
-    name = os.path.basename(path)
-    cd = re.search(r'(\d{2,4})\s*mA', name, re.I)
-    mv = re.search(r'(\d{3,5})\s*mV', name, re.I)
-    tc = re.search(r'(\d{1,3})\s*deg', name, re.I)
-    return (int(cd.group(1)) if cd else None,
-            int(mv.group(1)) if mv else None,
-            int(tc.group(1)) if tc else None)
-
-
-def discover_videos(folder):
-    """Find all usable videos in `folder`, keyed by current density."""
-    paths = []
-    for pat in VIDEO_EXTS:
-        paths.extend(glob.glob(os.path.join(folder, pat)))
-    found = {}
-    for p in sorted(paths):
-        cd, mv, tc = parse_video_name(p)
-        if cd is None:
-            print(f'  ignored (no "NNNmA" in name): {os.path.basename(p)}')
-            continue
-        if cd in found:
-            print(f'  ignored (duplicate {cd} mA/cm2): {os.path.basename(p)}')
-            continue
-        found[cd] = (p, mv, tc)
-    return found
+VIDEOS = {
+    100: ('20260713_bigbubbles_100mA_1760mV_39deg.mp4', 1760, 39),
+    300: ('20260713_bigbubbles_300mA_1971mV_39deg.mp4', 1971, 39),
+    600: ('20260713_bigbubbles_600mA_2133mV_41deg.mp4', 2133, 41),
+    900: ('20260713_bigbubbles_900mA_2264mV_42deg.mp4', 2264, 42),
+}
 
 FEATURE_NAMES = [
     'bubble_count', 'mean_diameter_mm', 'std_diameter_mm', 'max_diameter_mm',
@@ -124,45 +90,25 @@ def frame_features(gray, bubbles):
     ]
 
 
-def build_dataset(upload_dir=None):
-    """Build the feature dataset from the videos in `upload_dir`.
-
-    Pass the folder as the first command-line argument, e.g.
-        python3 train_from_videos.py ~/Downloads/videos
-    If omitted, looks in ./videos next to this script.
-    """
-    if upload_dir is None:
-        upload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'videos')
-    if not os.path.isdir(upload_dir):
-        print(f'ERROR: folder not found: {upload_dir}')
-        print('Put the 4 .mp4 files in a folder and pass it as an argument:')
-        print('    python3 train_from_videos.py /path/to/your/videos')
-        sys.exit(1)
-    print(f'Looking for videos in: {upload_dir}')
-    videos = discover_videos(upload_dir)
-    if len(videos) < 2:
-        print(f'\nERROR: found {len(videos)} usable video(s). Need at least 2 to train.')
-        print('Videos must be .mp4/.mov/.avi with the current density in the name,')
-        print('e.g. 20260713_bigbubbles_900mA_2264mV_42deg.mp4  or  run3_450mA.mp4')
-        sys.exit(1)
-
-    print(f'Found {len(videos)} videos at: {sorted(videos.keys())} mA/cm2\n')
+def build_dataset(upload_dir='videos'):
     X, y, groups = [], [], []
-    for cd in sorted(videos):
-        path, mv, tc = videos[cd]
+    for cd, (fname, mv, deg) in VIDEOS.items():
+        path = os.path.join(upload_dir, fname)
+        if not os.path.exists(path):
+            alt = os.path.join(upload_dir, fname.replace('.mp4', '__1_.mp4'))
+            path = alt if os.path.exists(alt) else path
+        if not os.path.exists(path):
+            print(f'  skip (missing): {fname}')
+            continue
         frames, fps = load_video_gray(path)
         bg = compute_background(frames)
         thr = auto_threshold(frames, bg=bg)
-        for g in frames:
+        for i, g in enumerate(frames):
             bubbles = detect_bubbles_bgsub(g, bg, thr)
             X.append(frame_features(g, bubbles))
             y.append(cd)
             groups.append(cd)
-        extra = []
-        if mv: extra.append(f'{mv} mV')
-        if tc: extra.append(f'{tc} C')
-        suffix = f'  [{", ".join(extra)}]' if extra else ''
-        print(f'  {cd:>4} mA/cm2: {len(frames)} frames, threshold={thr:.1f}{suffix}')
+        print(f'  {cd:>4} mA/cm2: {len(frames)} frames, threshold={thr:.1f}')
     return np.array(X, dtype=float), np.array(y, dtype=float), np.array(groups)
 
 
@@ -172,7 +118,7 @@ def main():
     from sklearn.metrics import mean_absolute_error, r2_score
 
     print('Extracting features from videos...')
-    folder = sys.argv[1] if len(sys.argv) > 1 else None
+    folder = sys.argv[1] if len(sys.argv) > 1 else 'videos'
     X, y, groups = build_dataset(folder)
     print(f'\nDataset: {X.shape[0]} frames x {X.shape[1]} features, '
           f'{len(np.unique(groups))} operating points\n')
@@ -192,6 +138,17 @@ def main():
     print(f'\nLEAVE-ONE-VIDEO-OUT  MAE = {mae:.1f} mA/cm2   '
           f'(range of targets: {truths.min():.0f}-{truths.max():.0f})')
     print('NOTE: effective n = 4. Indicative only, not a reportable accuracy.')
+
+    # For comparison only: a random split of the frames, which places
+    # near-identical frames of one recording in both training and test sets.
+    from sklearn.model_selection import KFold, cross_val_predict
+    p_rand = cross_val_predict(
+        RandomForestRegressor(n_estimators=300, random_state=0, min_samples_leaf=2),
+        X, y, cv=KFold(5, shuffle=True, random_state=0))
+    r2_rand = r2_score(y, p_rand)
+    mae_rand = mean_absolute_error(y, p_rand)
+    print(f'\nRANDOM 5-FOLD FRAME SPLIT  MAE = {mae_rand:.1f} mA/cm2   R2 = {r2_rand:.3f}'
+          '   (near-duplicate frames in train and test; not a measure of generalisation)')
 
     # In-distribution reference: train on all data, report feature importance.
     model = RandomForestRegressor(n_estimators=400, random_state=0, min_samples_leaf=2)
@@ -213,7 +170,9 @@ def main():
                'predicted': [float(p) for p in preds],
                'truth': [float(t) for t in truths],
                'feature_importance': {n: float(v) for n, v in imp},
-               'n_frames': int(X.shape[0])},
+               'n_frames': int(X.shape[0]),
+               'random_split_mae': float(mae_rand),
+               'random_split_r2': float(r2_rand)},
               open('training_report.json', 'w'), indent=1)
     print('Saved training_report.json')
 

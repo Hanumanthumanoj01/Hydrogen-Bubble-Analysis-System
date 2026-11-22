@@ -1,11 +1,15 @@
 """
 bubble_analysis.py
 ==================
+Library module, not run directly: imported by main.py (Image Analyzer tab)
+and run_all.py. To use it, start the backend:  uvicorn main:app --port 8000
+
 Core image analysis engine.
 
 Implements the two-branch pipeline from the project exposé:
   Branch 1 — Shannon (information) entropy, reproducing Wagner et al. (2025)
-  Branch 2 — Geometric bubble detection (Hough Circle Transform + top-hat filter)
+  Branch 2 — Geometric bubble detection: "Every bubble" (rim-coverage test,
+             detect_bubbles) or "Main bubbles" (detect_primary.py)
 
 All derived metrics follow the paper's calibration:
   - 0.0064 mm/pixel (telephoto/microscope lens)
@@ -40,24 +44,52 @@ class BubbleAnalyzer:
         electrode_type: str,
         cathode_area: float,
         sensitivity: str = "medium",
-        contrast_mode: str = "dark",
+        contrast_mode: str = "dark",       # kept for old callers; both polarities are tested
         roi: Optional[Tuple[float, float, float]] = None,
+        detector: str = "standard",
+        mm_min: float = 0.20,
+        mm_max: float = 0.90,
+        min_pct: float = 3.0,
+        max_pct: float = 60.0,
     ) -> Dict[str, Any]:
-        """Run the complete two-branch pipeline and return all metrics + images."""
+        """
+        Run the complete two-branch pipeline and return all metrics + images.
+
+        detector selects which geometric branch runs.
+
+          "standard"  the original multi-cue detector. It reports every bubble
+                      it can find, and it is the one the published counts of
+                      123 / 123 / 110 were validated against, so it stays the
+                      default and those numbers stay reproducible.
+
+          "primary"   the targeted detector of detect_primary.py, which finds
+                      only the large, well-formed bubbles between mm_min and
+                      mm_max and verifies each one against its radial
+                      brightness profile. Use it when the question is whether
+                      the big bubbles were found accurately rather than how
+                      many bubbles there are in total.
+        """
 
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
         # ── Branch 1: Shannon entropy ─────────────────────────────────────────
+        # Unaffected by the detector choice: it never looks at the detections.
         H, H_norm = self.shannon_entropy(gray)
 
         # ── Branch 2: Geometric bubble detection ──────────────────────────────
-        bubbles = self.detect_bubbles(gray, sensitivity, contrast_mode, roi)
+        if detector in ("primary", "ring"):
+            bubbles = self._detect_primary(
+                gray, mm_min, mm_max, min_pct, max_pct, bgr=img_bgr,
+                mode=("ring" if detector == "ring" else "core"))
+        else:
+            bubbles = self.detect_bubbles(img_bgr, sensitivity, roi)
 
         # ── Derived metrics ───────────────────────────────────────────────────
         metrics = self.derive_metrics(bubbles, gray.shape, current_density, cathode_area)
 
         # ── Overlay images (base64 PNG) ───────────────────────────────────────
-        overlay_b64 = self._make_overlay(img_bgr.copy(), bubbles, self.last_scores)
+        overlay_b64 = self._make_overlay(img_bgr.copy(), bubbles, self.last_scores,
+                                         bold=(detector in ("primary", "ring")))
         heatmap_b64 = self._make_heatmap(gray.shape, bubbles)
         histogram_b64 = self._make_histogram(gray)
 
@@ -105,284 +137,131 @@ class BubbleAnalyzer:
         return H, H_norm
 
     # ── Branch 2: Bubble detection ────────────────────────────────────────────
+    def _detect_primary(self, gray, mm_min, mm_max, min_pct=3.0, max_pct=60.0, bgr=None,
+                        mode="core"):
+        """
+        Bridge to detect_primary.py.
+
+        min_pct and max_pct are the bubble diameter as a percentage of the
+        image height. Sizing this way rather than in millimetres is what makes
+        the same setting work on a 640 x 480 frame and on a zoomed screen
+        capture of the same recording: a bubble that fills a tenth of the
+        picture fills a tenth of it at any resolution.
+
+        Returns the same (x, y, r) tuples the rest of this class expects, and
+        fills last_scores with the detector's own confidence so the overlay
+        colours mean the same thing in both modes. Imported here rather than at
+        module level so that a missing scikit-image only disables this mode
+        instead of breaking the whole backend.
+        """
+        try:
+            from detect_primary import detect_primary
+        except ImportError as exc:
+            raise RuntimeError(
+                "The large-bubble detector needs scikit-image. "
+                "Install it with:  pip3 install scikit-image"
+            ) from exc
+
+        hits = detect_primary(gray, (mm_min, mm_max), MM_PER_PIXEL,
+                              size_frac=(min_pct / 100.0, max_pct / 100.0), bgr=bgr,
+                              mode=mode)
+        out, scores = [], {}
+        # a circle touching the camera's overlay text, the crosshair, a black
+        # border or the player bar of a screen capture is not a bubble
+        valid = picture_mask(bgr) if bgr is not None else np.ones(gray.shape, bool)
+        H, W = valid.shape
+        for h in hits:
+            t = (int(h["x"]), int(h["y"]), int(round(h["r_px"])))
+            x0, x1 = max(0, t[0] - t[2]), min(W, t[0] + t[2] + 1)
+            y0, y1 = max(0, t[1] - t[2]), min(H, t[1] + t[2] + 1)
+            if x1 - x0 < 2 * t[2] or y1 - y0 < 2 * t[2]:
+                continue                       # cut off by the image edge
+            yy, xx = np.ogrid[y0:y1, x0:x1]
+            disc = np.hypot(xx - t[0], yy - t[1]) <= t[2]
+            if valid[y0:y1, x0:x1][disc].mean() < 0.97:
+                continue
+            out.append(t)
+            # contrast is in standard deviations; 2 sd is already emphatic, so
+            # that is taken as the top of the confidence scale.
+            scores[t] = float(min(1.0, (h["contrast"] / 2.0) * h["agreement"]))
+        self.last_scores = scores
+        return out
+
     def detect_bubbles(
         self,
-        gray: np.ndarray,
+        bgr: np.ndarray,
         sensitivity: str = "medium",
-        contrast_mode: str = "dark",
         roi: Optional[Tuple[float, float, float]] = None,
     ) -> List[Tuple[float, float, float]]:
         """
-        Detect bubbles using:
-          1. CLAHE                         — local contrast boost for faint/small bubbles
-          2. Morphological black/top-hat filter — removes cross-hatched grid background
-          3. Median blur                   — suppresses noise
-          4. Hough Circle Transform        — finds circular features
-          5. Non-max suppression           — collapses duplicate overlapping detections
+        "Every bubble, froth included": the rim-coverage detector.
 
-        contrast_mode:
-          'dark'   — real hydrogen bubbles (they block the backlight). Default.
-          'bright' — for footage of specular/backlit round objects that show as
-                     bright highlights rather than dark blobs (e.g. water
-                     droplets on a lit reflective surface).
-          'both'   — runs dark and bright as two independent passes and merges
-                     the results. NOTE: this must stay two independent passes,
-                     not one combined threshold — combining polarities in a
-                     single binary mask lets nearby opposite-polarity features
-                     get bridged together by the morphological closing step,
-                     which then FAILS the circularity filter and rejects both.
-                     (Verified: naive combination collapsed detections well
-                     below either single polarity alone.)
+        WHY IT WAS REWRITTEN (November 2026)
+        ------------------------------------
+        The earlier version proposed circles with the Hough transform and kept
+        a circle when a weighted score passed a threshold. The largest weight
+        went to "size close to 0.5 mm", so a ring drawn on empty background of
+        the right size passed. Its counts on the three published images (123,
+        123, 110) fell inside the published range, but many circles did not
+        sit on bubbles, and on screen captures it circled the timestamp, the
+        crosshair, the black border and the player bar.
 
-        roi: optional (center_x_frac, center_y_frac, radius_frac) — restricts
-        detection to a circular region of the frame (e.g. to exclude
-        equipment/rim visible around a real viewing window). Fractions of
-        min(width, height)/2 and image dimensions, matching the frontend's
-        click-to-place ROI control.
+        HOW IT WORKS
+        ------------
+        1. picture_mask() finds the camera picture: overlays, borders and a
+           media-player bar are excluded, and so is any circle touching them.
+        2. The picture is scaled to a height of 420 px, so the same settings
+           work on a 640 x 480 frame and on a 2000 px screen capture.
+        3. Candidates come from two matched filters at radii from 1.2 % to
+           20 % of the picture height: a bright ring around a darker inside
+           (how a bubble looks on the GDE images, lit from the camera side)
+           and a dark disc in a brighter surround (the dark-core bubbles on
+           the ANS plate).
+        4. Each candidate is unrolled into polar coordinates (48 angles) and
+           tested. A circle is kept only when
+             - the rim stands out from the inside of the bubble at no fewer
+               than 80-90 % of the angles (a straight mesh streak crosses a
+               circle at two angles only),
+             - the rim lies at the same radius all round (spread <= 12 % R),
+             - it is round, not a square mesh opening (four-fold component of
+               the rim radius <= 5 % R),
+             - its contrast exceeds 4 to 6 times the texture noise around it.
+        5. A large circle that contains two or more smaller accepted circles
+           is dropped: a bubble does not contain bubbles.
+        6. Circles more than three times the median size must be confirmed by
+           the large-bubble rim detector (detect_primary.py), which is reliable
+           for large bubbles; its confirmed circles replace them.
 
-        Returns list of (x, y, r) in pixels.
+        Sensitivity sets the evidence required: low (fewer false circles),
+        medium, high (more bubbles found, more false ones).
+
+        Returns (x, y, r) in pixels of the input image; self.last_scores holds
+        a confidence in [0, 1] per circle.
         """
-        if contrast_mode == "both":
-            dark = self._detect_bubbles_single_pass(gray, sensitivity, "dark", roi)
-            dark_scores = dict(self.last_scores)
-            bright = self._detect_bubbles_single_pass(gray, sensitivity, "bright", roi)
-            dark_scores.update(self.last_scores)  # bright pass's scores take precedence on overlap
-            self.last_scores = dark_scores
-            return self._merge_bubble_lists(dark, bright)
-        return self._detect_bubbles_single_pass(gray, sensitivity, contrast_mode, roi)
-
-    @staticmethod
-    def _merge_bubble_lists(a, b):
-        """Two detections landing on the same spot (one from each polarity
-        pass) are almost always the same physical object caught twice."""
-        merged = list(a)
-        for cb in b:
-            dup = False
-            for ca in merged:
-                d = ((ca[0]-cb[0])**2 + (ca[1]-cb[1])**2) ** 0.5
-                if d < 0.6 * (ca[2] + cb[2]):
-                    dup = True
-                    break
-            if not dup:
-                merged.append(cb)
-        return merged
-
-    def _detect_bubbles_single_pass(
-        self,
-        gray: np.ndarray,
-        sensitivity: str,
-        contrast_mode: str,
-        roi: Optional[Tuple[float, float, float]],
-    ) -> List[Tuple[float, float, float]]:
-        """
-        Note on method: bilateral filtering and watershed segmentation were
-        tested as alternatives/additions here and empirically REJECTED — on
-        the real GDE sample images, watershed's jagged per-region boundaries
-        made the (correct, round) bubbles fail circularity checks, collapsing
-        counts from ~100 to ~25 (verified against these exact files). CLAHE
-        was the one change that consistently helped (+12-14% recall across
-        all three current-density samples, verified individually), so it's
-        the only preprocessing addition kept.
-        """
-        # ── CLAHE — local contrast enhancement ────────────────────────────────
-        # Boosts faint/small bubbles that a global threshold would miss, without
-        # the aggressive smoothing of a bilateral filter (which, tested here,
-        # slightly *reduced* recall by softening the edges Hough relies on).
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-
-        # ── Background / grid suppression (black-hat or top-hat) ─────────────
-        # Bubbles are usually DARK quasi-circular blobs on a lighter electrode/
-        # electrolyte background (they block the backlight): MORPH_BLACKHAT is
-        # the correct polarity for that. 'bright' mode (MORPH_TOPHAT) is for
-        # footage where round objects show as bright highlights instead —
-        # arbitrary uploaded video isn't guaranteed to follow the lab-bubble
-        # convention the way the calibrated GDE sample images do.
-        kernel_size = max(31, int(gray.shape[0] * 0.06) | 1)  # odd, ~6% of height
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-        op = cv2.MORPH_TOPHAT if contrast_mode == "bright" else cv2.MORPH_BLACKHAT
-        filtered = cv2.morphologyEx(enhanced, op, kernel)
-
-        # ── Denoise ──────────────────────────────────────────────────────────
-        blurred = cv2.medianBlur(filtered, 5)
-
-        # ── Optional circular ROI mask — exclude equipment/rim outside it ────
+        valid = picture_mask(bgr)
         if roi is not None:
-            h, w = gray.shape
+            h, w = valid.shape
             cx_frac, cy_frac, r_frac = roi
-            cx, cy = w * cx_frac, h * cy_frac
-            max_r = min(w, h) / 2 * r_frac
             yy, xx = np.ogrid[:h, :w]
-            mask = (xx - cx) ** 2 + (yy - cy) ** 2 > max_r ** 2
-            blurred = blurred.copy()
-            blurred[mask] = 0
-
-        # ── Sensitivity → Hough parameters ───────────────────────────────────
-        sens_map = {
-            "low":    {"dp": 1.5, "minDist": 30, "param1": 60, "param2": 35, "minR": 5,  "maxR": 80},
-            "medium": {"dp": 1.2, "minDist": 18, "param1": 50, "param2": 28, "minR": 4,  "maxR": 80},
-            "high":   {"dp": 1.0, "minDist": 12, "param1": 40, "param2": 20, "minR": 3,  "maxR": 80},
-        }
-        p = sens_map.get(sensitivity, sens_map["medium"])
-
-        circles = cv2.HoughCircles(
-            blurred,
-            cv2.HOUGH_GRADIENT,
-            dp=p["dp"],
-            minDist=p["minDist"],
-            param1=p["param1"],
-            param2=p["param2"],
-            minRadius=p["minR"],
-            maxRadius=p["maxR"],
-        )
-
-        if circles is None:
-            return []
-
-        circles = np.round(circles[0]).astype(int)
-        # Filter: keep circles fully inside the image
-        h, w = gray.shape
-        valid = [
-            (float(x), float(y), float(r))
-            for x, y, r in circles
-            if 0 <= x - r and x + r <= w and 0 <= y - r and y + r <= h
-        ]
-
-        # ── Non-max suppression — collapse duplicate/overlapping detections ────
-        # Hough Circle Transform frequently fits SEVERAL overlapping circles to
-        # the same physical bubble (especially at larger radii, where a bigger
-        # circle's longer perimeter accumulates more votes even when the fit is
-        # weaker per-pixel than a smaller, tighter circle nearby). Left
-        # unfiltered, this is exactly what inflates bubble_count and
-        # surface_coverage_pct far past reality — the sum of all raw circle
-        # areas can be 10x+ the image area even though only a fraction of the
-        # pixels are actually bubble. We de-duplicate by processing smallest
-        # circles first (a tight, well-localized fit is stronger evidence of a
-        # real single bubble than a large loose one) and rejecting any larger
-        # candidate whose center falls within the combined-radius neighborhood
-        # of a circle already kept.
-        valid.sort(key=lambda c: c[2])  # smallest radius first
-        kept: List[Tuple[float, float, float]] = []
-        for x, y, r in valid:
-            is_duplicate = False
-            for kx, ky, kr in kept:
-                dist = ((x - kx) ** 2 + (y - ky) ** 2) ** 0.5
-                if dist < 0.5 * (r + kr):
-                    is_duplicate = True
-                    break
-            if not is_duplicate:
-                kept.append((x, y, r))
-        hough_bubbles = kept
-
-        # ── Second, independent candidate generator (contour/blob-based) ─────
-        # Hough votes for circular edges; this instead finds connected regions
-        # in the same thresholded map and fits an enclosing circle to each.
-        # It's a genuinely different detection mechanism (not the same method
-        # renamed), so it catches some real bubbles Hough's voting scheme
-        # misses — merged in below, not used alone.
-        contour_bubbles = self._contour_candidates(blurred, sensitivity)
-        merged = self._merge_bubble_lists(hough_bubbles, contour_bubbles)
-
-        # ── Multi-cue confidence score, replacing a chain of hard AND'd ───────
-        # thresholds with one weighted composite. Cues: shape (circularity of
-        # a locally re-derived contour), size plausibility (vs. the paper's
-        # 0.1-1.1mm range), local contrast MAGNITUDE (checked empirically:
-        # direction — dark-center vs bright-center — was NOT reliable, split
-        # roughly 9/15 vs 6/15 on real detections, so only magnitude is used),
-        # and edge strength (mean gradient sampled around the boundary).
-        # Weights are hand-set and documented as a placeholder for what should
-        # eventually be fit with logistic regression against human-corrected
-        # labels — i.e. exactly the Sprint-7 ML classifier already planned,
-        # just moved to candidate-level features instead of whole-image ones.
-        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-        grad_mag = np.sqrt(gx ** 2 + gy ** 2)
-
-        score_thresh = {"low": 0.55, "medium": 0.45, "high": 0.35}.get(sensitivity, 0.45)
-        scored_bubbles = []
-        self.last_scores = {}
-        for x, y, r in merged:
-            p_bubble, components = self._score_candidate(gray, grad_mag, x, y, r)
-            if p_bubble >= score_thresh:
-                scored_bubbles.append((x, y, r))
-                self.last_scores[(x, y, r)] = p_bubble
-
-        return scored_bubbles
-
-    @staticmethod
-    def _contour_candidates(binary_or_gray, sensitivity):
-        """Second candidate generator: connected-component contours on the
-        same preprocessed map Hough uses, each fit to a minimum enclosing
-        circle. Independent failure mode from Hough's circular voting."""
-        _, binary = cv2.threshold(binary_or_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        minR = {"low": 9, "medium": 6, "high": 5}.get(sensitivity, 6)
-        out = []
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < np.pi * minR * minR * 0.5:
-                continue
-            (x, y), r = cv2.minEnclosingCircle(c)
-            if r < minR or r > 110:
-                continue
-            out.append((float(x), float(y), float(r)))
-        return out
-
-    @staticmethod
-    def _score_candidate(gray, grad_mag, x, y, r, mm_per_px: float = MM_PER_PIXEL):
-        """Weighted multi-cue plausibility score in [0, 1]. See the note in
-        _detect_bubbles_single_pass on where the weights come from and how
-        they should eventually be replaced with fitted ones."""
-        H, W = gray.shape
-        xi, yi, ri = int(round(x)), int(round(y)), max(1, int(round(r)))
-
-        # shape: circularity of a locally re-derived contour (robust to
-        # whole-image segmentation artifacts since it's re-thresholded in a
-        # small patch around just this candidate)
-        pad = int(ri * 1.6)
-        x0, x1 = max(0, xi - pad), min(W, xi + pad)
-        y0, y1 = max(0, yi - pad), min(H, yi + pad)
-        patch = gray[y0:y1, x0:x1]
-        shape_score = 0.0
-        if patch.size > 0:
-            _, local_bin = cv2.threshold(patch, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            contours, _ = cv2.findContours(local_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if contours:
-                best = min(contours, key=lambda c: abs(cv2.contourArea(c) - np.pi * ri * ri))
-                area = cv2.contourArea(best)
-                perim = cv2.arcLength(best, True)
-                if perim > 0 and area > 0:
-                    shape_score = float(np.clip(4 * np.pi * area / (perim * perim), 0, 1))
-
-        # size: bell-curve plausibility vs the paper's 0.1-1.1mm range
-        diam_mm = 2 * ri * mm_per_px
-        size_score = float(np.exp(-((diam_mm - 0.5) ** 2) / (2 * 0.45 ** 2)))
-
-        # contrast: |inner - outer| MAGNITUDE only (direction tested unreliable)
-        mask_in = np.zeros(gray.shape, np.uint8)
-        cv2.circle(mask_in, (xi, yi), max(1, int(ri * 0.5)), 255, -1)
-        mask_out = np.zeros(gray.shape, np.uint8)
-        cv2.circle(mask_out, (xi, yi), int(ri * 1.4), 255, -1)
-        cv2.circle(mask_out, (xi, yi), ri, 0, -1)
-        inner = gray[mask_in == 255].mean() if (mask_in == 255).any() else 128.0
-        outer = gray[mask_out == 255].mean() if (mask_out == 255).any() else 128.0
-        contrast_score = float(np.clip(abs(inner - outer) / 40.0, 0, 1))
-
-        # edge: mean gradient magnitude sampled around the boundary ring
-        n = 24
-        vals = []
-        for i in range(n):
-            th = 2 * np.pi * i / n
-            px, py = int(xi + ri * np.cos(th)), int(yi + ri * np.sin(th))
-            if 0 <= px < W and 0 <= py < H:
-                vals.append(grad_mag[py, px])
-        edge_score = float(np.clip((np.mean(vals) if vals else 0.0) / 80.0, 0, 1))
-
-        weights = {"shape": 0.35, "size": 0.25, "contrast": 0.15, "edge": 0.25}
-        components = {"shape": shape_score, "size": size_score,
-                      "contrast": contrast_score, "edge": edge_score}
-        p_bubble = sum(weights[k] * components[k] for k in weights)
-        return float(np.clip(p_bubble, 0, 1)), components
+            valid &= (xx - w * cx_frac) ** 2 + (yy - h * cy_frac) ** 2 <= (min(w, h) / 2 * r_frac) ** 2
+        hits = rim_coverage_detect(bgr, valid, sensitivity)
+        out = [(x, y, r, sc) for x, y, r, sc in hits]
+        r_med = float(np.median([t[2] for t in out])) if len(out) >= 10 else None
+        if r_med is not None:
+            out = [t for t in out if t[2] <= 3.0 * r_med]
+        big = []
+        try:
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            for x, y, r in self._detect_primary(gray, 0.2, 0.9, 3.0, 60.0, bgr=bgr):
+                if r_med is not None and r < 2.0 * r_med:
+                    continue
+                big.append((float(x), float(y), float(r), 1.0))
+        except RuntimeError:
+            pass                      # scikit-image missing: rim-coverage circles only
+        out = [t for t in out if all(np.hypot(t[0] - B[0], t[1] - B[1]) > 0.9 * B[2] for B in big)]
+        res = big + out
+        self.last_scores = {(int(x), int(y), int(round(r))): float(sc) for x, y, r, sc in res}
+        return [(int(x), int(y), int(round(r))) for x, y, r, _ in res]
 
     # ── Derived metrics ───────────────────────────────────────────────────────
     @staticmethod
@@ -456,16 +335,40 @@ class BubbleAnalyzer:
 
     # ── Overlay image ─────────────────────────────────────────────────────────
     @staticmethod
-    def _make_overlay(img: np.ndarray, bubbles: List[Tuple], scores: Optional[Dict] = None) -> str:
+    def _make_overlay(img: np.ndarray, bubbles: List[Tuple],
+                      scores: Optional[Dict] = None, bold: bool = False) -> str:
+        """
+        Draw the detections.
+
+        Line thickness is set from the size of the image rather than fixed at
+        one pixel. A one-pixel circle is legible on a 640 x 480 frame and all
+        but invisible on a 2000 px screen capture shrunk to fit a panel, which
+        is how the detections came to look faint and broken on screen.
+
+        In bold mode every circle is drawn in one bright green, with a dark
+        outline underneath so it stays visible over both the bright plate and
+        the dark bubble. Confidence is not colour-coded there: in that mode
+        everything shown has already passed verification, and a figure that is
+        going into a report reads better when a circle is simply a circle.
+        """
+        h, w = img.shape[:2]
+        t = max(2, int(round(min(h, w) / 260.0)))
         for x, y, r in bubbles:
+            x, y, r = int(x), int(y), int(r)
+            if bold:
+                cv2.circle(img, (x, y), r, (0, 0, 0), t + 2, cv2.LINE_AA)
+                cv2.circle(img, (x, y), r, (60, 255, 60), t, cv2.LINE_AA)
+                cv2.drawMarker(img, (x, y), (60, 255, 60), cv2.MARKER_CROSS,
+                               max(8, t * 5), t)
+                continue
             if scores is not None:
                 p = scores.get((x, y, r), 0.5)
                 # green (confident) -> yellow -> red (marginal), BGR order
                 color = (0, int(255 * min(1, p * 2)), int(255 * min(1, (1 - p) * 2)))
             else:
                 color = (0, 0, 255)
-            cv2.circle(img, (int(x), int(y)), int(r), color, 1)
-            cv2.circle(img, (int(x), int(y)), 2, (0, 255, 0), -1)
+            cv2.circle(img, (x, y), r, color, max(1, t - 1), cv2.LINE_AA)
+            cv2.circle(img, (x, y), 2, (0, 255, 0), -1)
         _, buf = cv2.imencode(".png", img)
         return base64.b64encode(buf).decode()
 
@@ -495,3 +398,228 @@ class BubbleAnalyzer:
             cv2.line(h_img, (x, 200), (x, 200 - val), (100, 180, 255), 2)
         _, buf = cv2.imencode(".png", h_img)
         return base64.b64encode(buf).decode()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Camera picture inside a screen capture
+# ─────────────────────────────────────────────────────────────────────────────
+
+def picture_mask(bgr: np.ndarray) -> np.ndarray:
+    """
+    True where the pixels belong to the camera picture.
+
+    A screen capture of the video player contains more than the picture: a
+    black letterbox border, the player bar with its coloured progress line,
+    and the camera's own red overlay (frame rate, timestamp, crosshair). None
+    of it is a bubble. Excluded are
+      - coloured pixels (the camera image is grey), widened by a few pixels,
+      - columns and rows without texture at the sides (the letterbox),
+      - everything below a coloured line that crosses most of the width in
+        the bottom fifth of the image (the player's progress bar).
+    On a plain camera frame the whole image is returned.
+    """
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    H, W = g.shape
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    colour = (hsv[..., 1] > 90) & (hsv[..., 2] > 60)
+    lap = np.abs(cv2.Laplacian(cv2.GaussianBlur(g, (3, 3), 0).astype(np.float32), cv2.CV_32F))
+    tex = cv2.blur(lap, (31, 31))
+
+    def longest_run(v):
+        ok = v > 0.35 * np.median(v)
+        best, best_len, start = (0, len(v)), 0, None
+        for i, o in enumerate(np.r_[ok, False]):
+            if o and start is None:
+                start = i
+            if not o and start is not None:
+                if i - start > best_len:
+                    best_len, best = i - start, (start, i)
+                start = None
+        return best
+
+    x0, x1 = longest_run(np.median(tex, axis=0))
+    y0, y1 = longest_run(np.median(tex, axis=1))
+    frac = colour[:, x0:x1].mean(axis=1)
+    bar = [y for y in range(int(0.8 * H), H) if frac[y] > 0.5]
+    if bar:
+        y1 = min(y1, bar[0] - 4)
+    m = np.zeros((H, W), bool)
+    m[y0:y1, x0:x1] = True
+    # Coloured overlay TEXT excludes its area. Thin coloured LINES (the
+    # crosshair) do not: a crosshair drawn across a bubble does not make the
+    # bubble less real, and rejecting every circle it touches loses bubbles.
+    # A crosshair line is a band of at most a few pixels along a whole row or
+    # column (broken into pieces where the plate is bright); text is a band
+    # tens of pixels tall.
+    text = colour.copy()
+
+    def thin_bands(frac):
+        on = np.r_[frac > 0.15, False]
+        out, start = [], None
+        for i, o in enumerate(on):
+            if o and start is None:
+                start = i
+            if not o and start is not None:
+                if i - start <= max(6, int(0.006 * len(frac))):
+                    out.append((start, i))
+                start = None
+        return out
+    for a0, a1 in thin_bands(colour[:, x0:x1].mean(axis=1)):
+        text[max(0, a0 - 3):a1 + 3, :] = False
+    for a0, a1 in thin_bands(colour[y0:y1, :].mean(axis=0)):
+        text[:, max(0, a0 - 3):a1 + 3] = False
+    text = text.astype(np.uint8)
+    m &= ~(cv2.dilate(text, np.ones((7, 7), np.uint8)) > 0)
+    return m
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Rim-coverage detector (used by BubbleAnalyzer.detect_bubbles)
+# ─────────────────────────────────────────────────────────────────────────────
+
+RIM_NORM_H = 420.0          # working height of the picture, px
+RIM_REL = (0.012, 0.20)     # radius range, fraction of the picture height
+RIM_SENS = {                # per-angle k (x noise), coverage, contrast (x noise)
+    "low":    (4.0, 0.90, 6.0),
+    "medium": (3.5, 0.85, 5.0),
+    "high":   (3.0, 0.80, 4.0),
+}
+RIM_SPREAD_MAX = 0.12       # std of the rim radius over the angles, x R
+RIM_H4_MAX = 0.05           # four-fold (square) component of the rim radius, x R
+
+
+def _rim_kernel(r, kind):
+    s = int(np.ceil(1.6 * r)) + 2
+    yy, xx = np.mgrid[-s:s + 1, -s:s + 1]
+    d = np.hypot(xx, yy)
+    if kind == "ring":
+        pos, neg = np.abs(d - r) <= max(1.2, 0.15 * r), d <= 0.6 * r
+    else:
+        pos, neg = (d >= 1.1 * r) & (d <= 1.45 * r), d <= 0.7 * r
+    return (pos / pos.sum() - neg / max(neg.sum(), 1)).astype(np.float32)
+
+
+def _rim_polar(g, x, y, R, n=48, k=29):
+    ang = np.linspace(0, 2 * np.pi, n, endpoint=False)[:, None]
+    rr = np.linspace(0.2, 1.6, k)
+    mx = (x + R * rr[None, :] * np.cos(ang)).astype(np.float32)
+    my = (y + R * rr[None, :] * np.sin(ang)).astype(np.float32)
+    return cv2.remap(g, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE), rr
+
+
+def _rim_test(g, x, y, R, kind, noise, kfac):
+    """coverage, spread, contrast, rim radius factor, four-fold component"""
+    P, rr = _rim_polar(g, x, y, R)
+    inner = np.median(P[:, (rr >= 0.45) & (rr <= 0.7)], axis=1)   # clear of the highlight dot
+    if kind == "ring":
+        band = (rr >= 0.8) & (rr <= 1.2)
+        rim = P[:, band].max(axis=1)
+        pos = rr[band][P[:, band].argmax(axis=1)]
+        diff = rim - inner
+    else:
+        outer = np.median(P[:, (rr >= 1.15) & (rr <= 1.5)], axis=1)
+        dP = np.diff(P, axis=1)
+        rmid = 0.5 * (rr[1:] + rr[:-1])
+        b2 = (rmid >= 0.75) & (rmid <= 1.25)
+        pos = rmid[b2][dP[:, b2].argmax(axis=1)]
+        diff = outer - inner
+    hit = diff > kfac * noise
+    a = np.linspace(0, 2 * np.pi, len(pos), endpoint=False)
+    h4 = 2 * abs(np.mean((pos - pos.mean()) * np.exp(4j * a)))
+    spread = float(np.std(pos[hit])) if hit.sum() > 3 else 1.0
+    rpos = float(np.median(pos[hit])) if hit.any() else 1.0
+    return float(hit.mean()), spread, float(np.median(diff) / noise), rpos, float(h4)
+
+
+def rim_coverage_detect(bgr, valid, sensitivity="medium"):
+    """Returns [(x, y, r, score)] in pixels of bgr. See detect_bubbles."""
+    ys, xs = np.nonzero(valid)
+    if len(ys) == 0:
+        return []
+    by0, by1 = ys.min(), ys.max() + 1
+    s = RIM_NORM_H / max(1, by1 - by0)
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    g = cv2.resize(g, None, fx=s, fy=s, interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
+    v = cv2.resize(valid.astype(np.uint8), (g.shape[1], g.shape[0]),
+                   interpolation=cv2.INTER_NEAREST) > 0
+    g = cv2.createCLAHE(2.0, (8, 8)).apply(g).astype(np.float32)
+    g = cv2.GaussianBlur(g, (0, 0), 0.8)
+    g2 = cv2.resize(g, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    hp = g - cv2.GaussianBlur(g, (0, 0), 1.5)
+    noise_global = 1.4826 * float(np.median(np.abs(hp - np.median(hp)))) + 1e-3
+    sd = {w: np.sqrt(cv2.blur(hp * hp, (w, w))) + 1e-3 for w in (11, 21, 41, 81, 161)}
+    kfac, cmin, conmin = RIM_SENS.get(sensitivity, RIM_SENS["medium"])
+
+    # candidates: local maxima of the two matched filters over position and radius
+    radii, r = [], max(3.0, RIM_REL[0] * RIM_NORM_H)
+    while r <= RIM_REL[1] * RIM_NORM_H:
+        radii.append(r)
+        r *= 1.12
+    cands = []
+    for kind in ("ring", "disk"):
+        stack = np.stack([cv2.filter2D(g, -1, _rim_kernel(r, kind), borderType=cv2.BORDER_REFLECT)
+                          for r in radii])
+        for i, r in enumerate(radii):
+            R = stack[i]
+            mx = stack[max(0, i - 1):i + 2].max(axis=0)
+            ks = max(3, int(r) | 1)
+            pk = (R >= cv2.dilate(R, np.ones((ks, ks), np.uint8))) & (R >= mx) \
+                & (R > 1.2 * noise_global) & v
+            for y, x in zip(*np.nonzero(pk)):
+                cands.append((float(R[y, x]), float(x), float(y), r, kind))
+    # strongest first; the same spot at a neighbouring radius is one candidate
+    cands.sort(reverse=True)
+    pruned = []
+    grid = {}
+    for c in cands:
+        resp, x, y, r, kind = c
+        key = (int(x // 8), int(y // 8))
+        near = [p for dx in (-1, 0, 1) for dy in (-1, 0, 1) for p in grid.get((key[0] + dx, key[1] + dy), [])]
+        if any(p[4] == kind and np.hypot(p[1] - x, p[2] - y) < 0.35 * min(p[3], r)
+               and 0.75 < p[3] / r < 1.33 for p in near):
+            continue
+        pruned.append(c)
+        grid.setdefault(key, []).append(c)
+
+    t = np.linspace(0, 2 * np.pi, 64, endpoint=False)
+    acc = []
+    for resp, x, y, r, kind in pruned:
+        w = min(sd, key=lambda k: abs(k - 4 * r))
+        noise = max(noise_global, 0.75 * float(sd[w][int(y), int(x)]))
+        best = None
+        for f in (1.0, 0.85, 1.18):
+            R = r * f
+            if R < 8:     # small: test on the 2x image so the rim spans enough pixels
+                res = _rim_test(g2, 2 * x + 0.5, 2 * y + 0.5, 2 * R, kind, noise, kfac)
+            else:
+                res = _rim_test(g, x, y, R, kind, noise, kfac)
+            sc = res[0] + 0.1 * res[2]
+            if best is None or sc > best[0]:
+                best = (sc, R * res[3]) + res
+            if f == 1.0 and res[0] < cmin - 0.2:
+                break     # far from passing: no need to try other radii
+        sc, Rf, cov, spread, con, _, h4 = best
+        if not (cov >= cmin and spread <= RIM_SPREAD_MAX and h4 <= RIM_H4_MAX
+                and con >= conmin + (1.0 if kind == "disk" else 0.0)):
+            continue
+        # the circle and its surroundings must lie in the camera picture
+        px = (x + 1.5 * Rf * np.cos(t)).astype(int)
+        py = (y + 1.5 * Rf * np.sin(t)).astype(int)
+        ins = (px >= 0) & (py >= 0) & (px < g.shape[1]) & (py < g.shape[0])
+        ok = np.zeros(len(t), bool)
+        ok[ins] = v[py[ins], px[ins]]
+        x0, x1 = int(max(0, x - 1.2 * Rf)), int(min(g.shape[1], x + 1.2 * Rf + 1))
+        y0, y1 = int(max(0, y - 1.2 * Rf)), int(min(g.shape[0], y + 1.2 * Rf + 1))
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        disc = np.hypot(xx - x, yy - y) <= 1.2 * Rf
+        if ok.mean() >= 0.95 and v[y0:y1, x0:x1][disc].all():
+            acc.append((sc, x, y, Rf))
+    acc.sort(reverse=True)
+    acc = [a for a in acc if sum(1 for b in acc if b[3] < 0.6 * a[3]
+                                 and np.hypot(b[1] - a[1], b[2] - a[2]) < 0.85 * a[3]) < 2]
+    kept = []
+    for a in acc:
+        if all(np.hypot(a[1] - k[1], a[2] - k[2]) > 0.7 * max(a[3], k[3]) for k in kept):
+            kept.append(a)
+    top = max([k[0] for k in kept], default=1.0)
+    return [(x / s, y / s, R / s, min(1.0, sc / top)) for sc, x, y, R in kept]

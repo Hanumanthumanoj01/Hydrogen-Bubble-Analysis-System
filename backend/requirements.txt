@@ -1,9 +1,15 @@
-fastapi==0.111.0
-uvicorn[standard]==0.29.0
-python-multipart==0.0.9
-opencv-python-headless==4.9.0.80
-numpy==1.26.4
-scikit-learn==1.4.2
-xgboost==2.0.3
-joblib==1.4.2
-pydantic==2.7.1
+# requirements.txt — Python packages for the backend
+# WHERE: backend/requirements.txt
+# HOW TO USE:  pip3 install -r requirements.txt   (the cloud build runs this itself)
+# Only what the web server needs; the report scripts additionally use
+# scikit-learn and joblib (train_from_videos.py), installed separately.
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9
+numpy>=1.26
+opencv-python-headless>=4.9
+scipy>=1.12
+scikit-image>=0.22
+pandas>=2.1
+matplotlib>=3.8
+openpyxl>=3.1

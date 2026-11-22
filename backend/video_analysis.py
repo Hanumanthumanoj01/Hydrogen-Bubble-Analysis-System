@@ -1,6 +1,9 @@
 """
 video_analysis.py
 =================
+Library module, not run directly: imported by main.py (Video Analyzer tab)
+and run_all.py. To use it, start the backend:  uvicorn main:app --port 8000
+
 Bubble detection for REAL electrolysis video, using temporal background
 subtraction as the primary method.
 
@@ -294,6 +297,88 @@ class BubbleTracker:
             "mean_growth_rate_mm_per_s": float(np.mean(growth_rates)) if growth_rates else 0.0,
             "mean_max_diameter_mm": float(np.mean(max_radii) * 2 * MM_PER_PIXEL) if max_radii else 0.0,
         }
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Anchored (nucleation-site) bubble filter
+# ────────────────────────────────────────────────────────────────────────────
+def classify_anchored_bubbles(frames, bg, thresh, fps,
+                              min_frames_seen: int = 15,
+                              max_drift_px: float = 8.0,
+                              min_radius_px: float = 12.0,
+                              merge_dist_factor: float = 0.9):
+    """Separate real nucleation-site bubbles from tiny floating disturbance
+    bubbles, per Prof. Wagner's request (10 Sept 2026): "the tiny disturbing
+    bubbles in the liquid should be filtered out."
+
+    WHY A SIZE THRESHOLD ALONE DOES NOT WORK
+    -----------------------------------------
+    The raw radius distribution has no natural gap to cut at -- it is a
+    smooth, monotonically decreasing tail (checked on
+    bubble_video_2283mV_688mA_41deg.avi: 5541 raw detections, radius
+    percentiles 3.2 / 6.5 / 19.6 / 46.8 px at the 5/50/90/99th percentile,
+    no bimodal split). A fixed radius cutoff would be arbitrary.
+
+    WHAT ACTUALLY SEPARATES THEM
+    -----------------------------
+    A bubble growing at a nucleation site is PINNED to that bore: it stays
+    at very nearly the same (x, y) for many consecutive frames while it
+    grows. A "tiny disturbing" bubble drifting through the liquid is seen
+    briefly and moves. So the real discriminator is temporal behaviour, not
+    single-frame size:
+
+        frames_seen  >= min_frames_seen   (persists, not a one-frame blip)
+        position std <  max_drift_px      (pinned, not drifting)
+        max radius   >= min_radius_px     (large enough to be a real bubble,
+                                            not sensor/compression noise)
+
+    On the same 200-frame test video this collapsed 5541 raw per-frame
+    detections into 17 anchored tracks, matching the ~9-10 visible bores
+    plus a few genuine secondary sites. Nearby tracks belonging to the same
+    physical site (split across two tracker IDs when a bubble briefly
+    disappears/reforms) are then merged if their centers are closer than
+    `merge_dist_factor * (r1 + r2)`, giving ~10 final sites -- verified
+    visually against the frame.
+
+    Returns a list of dicts, one per surviving site:
+        {'x','y','r' (max radius seen), 'frames_seen', 'history'}
+    where 'history' is the list of (t, x, y, r) tuples from ALL merged
+    tracks at that site (used downstream to build p(x,y,d|j)).
+    """
+    tracker = BubbleTracker()
+    for idx, f in enumerate(frames):
+        dets = detect_bubbles_bgsub(f, bg, thresh)
+        tracker.update(dets, idx, idx / fps)
+
+    candidates = []
+    for tr in tracker.tracks:
+        h = tr["history"]
+        if len(h) < 2:
+            continue
+        xs = [p[1] for p in h]
+        ys = [p[2] for p in h]
+        rs = [p[3] for p in h]
+        pos_std = float(np.hypot(np.std(xs), np.std(ys)))
+        if (tr["frames_seen"] >= min_frames_seen
+                and pos_std < max_drift_px
+                and max(rs) >= min_radius_px):
+            candidates.append({"x": float(np.mean(xs)), "y": float(np.mean(ys)),
+                               "r": float(max(rs)), "frames_seen": tr["frames_seen"],
+                               "history": list(h)})
+
+    candidates.sort(key=lambda c: -c["frames_seen"])
+    merged: List[Dict[str, Any]] = []
+    for c in candidates:
+        placed = False
+        for m in merged:
+            d = np.hypot(c["x"] - m["x"], c["y"] - m["y"])
+            if d < merge_dist_factor * (c["r"] + m["r"]):
+                m["history"] = m["history"] + c["history"]
+                placed = True
+                break
+        if not placed:
+            merged.append(c)
+    return merged
 
 
 # ────────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,81 @@
+
+AW: local measurements and AI based bubble analysis
+Dear Prof. Wagner,
+
+Thank you very much for checking with Jonas, and for the new recordings — I have downloaded all six files from the SharePoint folder.
+
+**Server / upload**
+
+The SharePoint site works well for me, so please feel free to keep uploading there — no need for anything else. I have also created a private GitHub repository for the project, and I can add you if you would prefer to have the code and the data in one place. Either is fine.
+
+**Fisher Information — progress**
+
+Yes, I have implemented the workflow from your handout. Steps 1 to 5 are all running on the four ANS recordings from 13 July:
+
+- Step 1: the bubble-frequency map N(x,y|j)
+- Step 2: the mean local diameter d_m(x,y|j)
+- Step 3: comparison across the four current densities
+- Step 4: the state distribution p(x,y,d|j)
+- Step 5: the Fisher Information map I_j(x,y), computed between neighbouring current densities and restricted to a 3×3 nucleation-site section as you suggested
+
+The pipeline also exports the (x, y, d, t, j) table as CSV for every recording, which is the input format described in your handout.
+
+The maps show clear structure. However, I want to be open about one limitation: with the current amount of data, roughly 85 % of the (x, y, d) states are empty. Because the estimator uses ln p, these empty states have to be handled with a small smoothing term, which means the present Fisher values are still influenced by that smoothing rather than by the data alone. Restricting to the 3×3 section, as you recommended, improved this from about 92 % to 85 %, so your suggestion clearly helped — but longer recordings are what will make the result properly reliable. I will re-run everything as soon as more data is available.
+
+I can send the maps and the CSV tables straight away if you would like to look at them.
+
+**One question that the new data may answer**
+
+The Step 1 maps show the nucleation sites very clearly, arranged on a regular grid. In the video frames the spacing between neighbouring sites is almost exactly 200 pixels.
+
+If you can tell me the bore spacing in millimetres, I can derive the mm-per-pixel calibration directly from the recordings, without needing a separate calibration image. With the 0.0064 mm/pixel value from the 2025 paper, 200 pixels would correspond to a spacing of 1.28 mm — does that match the actual ANS geometry?
+
+This matters because every result in millimetres (bubble diameter, curvature, growth rate) depends on that constant, and I am not yet certain the paper's value applies to this camera setup.
+
+**Flattened bubbles**
+
+Thank you for pointing this out — I had not accounted for it. If a bubble is pressed flat against the window, the image shows a disc that is larger than the bubble's true spherical diameter, so the detector will overestimate its size and correspondingly underestimate the curvature K = 1/r. Bubble counts and the information entropy are not affected, since those do not depend on the scale.
+
+Before I decide how to handle it, may I ask: should flattened bubbles be excluded from the diameter statistics, or treated as a separate category? They may also be interesting in their own right, since a flattened bubble has a much larger three-phase contact line.
+
+**A note on the current densities**
+
+The new recordings (694, 721, 860, 884 mA/cm²) together with the July set give me eight distinct operating points, which is a good improvement. Five of them, though, lie between 600 and 900 mA/cm².
+
+For the machine-learning part and for the entropy-versus-current-density curve, a wider spread would help considerably — for example a few additional recordings in the 50–500 mA/cm² range. The number of distinct current densities matters much more than the length of each recording, because frames within one recording are very similar to each other.
+
+Thank you again for the recordings and for following up with Jonas.
+
+Best regards,
+Manoj Hanumanthu
+Two versions above — use the short one if you want to keep it light, the full one if you want to show depth.
+
+The thing in his email that matters most
+"the moment the bubble is flattened when it is pressed against the window from the inside"
+
+This isn't a passing remark — it's a measurement problem he's warning you about. A bubble squashed against the glass shows up in the image as a disc wider than the bubble actually is. So your detector overestimates diameter and underestimates curvature K = 1/r.
+
+Since curvature links directly to his micro-region model, this affects a core result. Counts and entropy are unaffected (no millimetres involved).
+
+Acknowledging it — and asking whether to exclude or separately categorise flattened bubbles — shows you understood why he mentioned it.
+
+Three practical points
+Server: he's already uploading to a SharePoint site called IndividualProjectHydrogenBubbleAnalysis. That's your answer — no need to set anything up. Mention the private GitHub repo as an option since he asked you to create one.
+
+Filenames work: bubble_video_2283mV_694mA_39deg.avi parses correctly with your existing code — it finds 694 mA, 2283 mV, 39 °C automatically. .avi is already in the supported list. Just drop them in videos/ and re-run.
+
+Current density spread: you now have 8 distinct points (100, 300, 600, 694, 721, 860, 884, 900) — up from 4, which genuinely helps. But five sit between 600 and 900. For the entropy curve and the ML you want spread, not clustering, so I've asked for a few in the 50–500 range.
+
+After you send it
+Download the six files, put the three .avi videos in backend/videos/, and run:
+
+bash
+python3 fisher_analysis.py videos 20 0 0 560 400
+python3 train_from_videos.py videos
+The empty-state percentage should drop and the ML MAE should improve with 7–8 operating points instead of 4. Send me the output and I'll check whether the numbers moved the way they should.
+
+
+Write a message…
+
+
+Claude is AI and can make mistakes. Please double-check responses.

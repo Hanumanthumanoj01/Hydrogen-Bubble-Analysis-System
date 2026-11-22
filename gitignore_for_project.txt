@@ -1,0 +1,23 @@
+# .gitignore — files that must NOT go to GitHub
+# WHERE: save this file as ".gitignore" (with the dot) in the project folder.
+# WHY: recordings and results are large (GitHub refuses files over 100 MB) and
+# are laboratory data; the code is what the cloud build needs.
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+frontend/dist/
+backend/static/
+backend/session_*/
+backend/Session_*/
+backend/videos/
+backend/results*/
+backend/_pixel_fisher_*/
+backend/figures_for_overleaf/
+backend/report_figures/
+backend/screenshots/
+*.avi
+*.mp4
+*.mov
+*.xlsx
+*.zip
