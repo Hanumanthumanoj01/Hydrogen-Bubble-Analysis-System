@@ -74,8 +74,3 @@ python3 fisher_analysis.py videos 20 0 0 560 400
 python3 train_from_videos.py videos
 The empty-state percentage should drop and the ML MAE should improve with 7–8 operating points instead of 4. Send me the output and I'll check whether the numbers moved the way they should.
 
-
-Write a message…
-
-
-Claude is AI and can make mistakes. Please double-check responses.
